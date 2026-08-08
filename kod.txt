@@ -1,0 +1,445 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <IRremote.h>
+#include <EEPROM.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int GSR_PIN = A0;
+const int IR_PIN = 11;
+
+// =========================================================================
+// 🎯 KUMANDA TUŞ KODLARI
+// =========================================================================
+#define TUS_1        0x45   // 1 Tuşu (Sorgu Bitir / Rapor & PIN & TEK KAYIT SİL)
+#define TUS_2        0x46   // 2 Tuşu (Ayarlar Menüsü)
+#define TUS_OK       0x1C   // OK Tuşu (Senkronize)
+#define TUS_YUKARI   0x18   // Yukarı Ok
+#define TUS_ASAGI    0x52   // Aşağı Ok
+#define TUS_SAG      0x5A   // Sağ Ok
+#define TUS_SOL      0x08   // Sol Ok
+// =========================================================================
+
+#define EEPROM_COUNT_ADDR 0   
+#define EEPROM_START_ADDR 1   
+#define MAX_RECORDS 30        
+#define RECORD_SIZE 5         
+
+float dynamicBaseline = 0;   
+bool isSynchronized = false;
+bool isFinished = false;
+bool inSettings = false; 
+
+// PIN GÜVENLİK
+bool pinLocked = false;
+int pinDigitCount = 0;
+
+// İSTATİSTİKLER
+int maxStressPercent = 0;
+int maxBPM = 0;
+int lieDetectionCount = 0;     
+unsigned long totalReadings = 0;
+unsigned long badReadings = 0;  
+
+// MATEMATİKSEL FİLTRE
+int lastRawVal = 0;
+int previousStress = 0;
+unsigned long highStressStartTime = 0;
+bool isHighStressActive = false;
+
+// AYARLAR DEĞİŞKENLERİ
+int stressThreshold = 55; 
+bool soundEnabled = true; 
+int baseBPM = 70;         
+int skinType = 1;         
+int sensorSpeed = 2;      
+int selectedProfile = 1;  
+
+int menuPage = 1;         // Toplam 8 Menü Sayfası
+int historyIndex = 1;     
+float filteredVal = 0;      
+
+unsigned long lastActivityTime = 0;
+bool inScreenSaver = false;
+
+byte barFull[8] = {B11111, B11111, B11111, B11111, B11111, B11111, B11111, B11111};
+byte heart[8]   = {B00000, B01010, B11111, B11111, B01110, B00000, B00000, B00000};
+
+// --- EEPROM KAYIT EKLEME ---
+void saveRecordToEEPROM(int profile, int stress, int bpm, int lies, int trust) {
+  int totalRecords = EEPROM.read(EEPROM_COUNT_ADDR);
+  if (totalRecords > 250) totalRecords = 0;
+
+  int targetIndex = totalRecords;
+  if (totalRecords >= MAX_RECORDS) {
+    targetIndex = MAX_RECORDS - 1; 
+    for (int i = 0; i < MAX_RECORDS - 1; i++) {
+      for (int b = 0; b < RECORD_SIZE; b++) {
+        byte val = EEPROM.read(EEPROM_START_ADDR + ((i + 1) * RECORD_SIZE) + b);
+        EEPROM.write(EEPROM_START_ADDR + (i * RECORD_SIZE) + b, val);
+      }
+    }
+  } else {
+    totalRecords++;
+    EEPROM.write(EEPROM_COUNT_ADDR, totalRecords);
+  }
+
+  int writeAddr = EEPROM_START_ADDR + (targetIndex * RECORD_SIZE);
+  EEPROM.write(writeAddr + 0, (byte)profile);
+  EEPROM.write(writeAddr + 1, (byte)stress);
+  EEPROM.write(writeAddr + 2, (byte)bpm);
+  EEPROM.write(writeAddr + 3, (byte)lies);
+  EEPROM.write(writeAddr + 4, (byte)trust);
+}
+
+// --- TEK KAYIT SİLME MANTIĞI ---
+void deleteSingleRecord(int indexToDelete) {
+  int totalRecords = EEPROM.read(EEPROM_COUNT_ADDR);
+  if (totalRecords == 0) return;
+
+  // Silinen kayıttan sonraki tüm kayıtları 1 adım sola kaydır
+  for (int i = indexToDelete - 1; i < totalRecords - 1; i++) {
+    for (int b = 0; b < RECORD_SIZE; b++) {
+      byte nextVal = EEPROM.read(EEPROM_START_ADDR + ((i + 1) * RECORD_SIZE) + b);
+      EEPROM.write(EEPROM_START_ADDR + (i * RECORD_SIZE) + b, nextVal);
+    }
+  }
+
+  totalRecords--;
+  EEPROM.write(EEPROM_COUNT_ADDR, totalRecords);
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("KAYIT #"); lcd.print(indexToDelete);
+  lcd.setCursor(0, 1); lcd.print(" BASARIYLA SILINDI");
+  delay(1200);
+
+  if (historyIndex > totalRecords) historyIndex = totalRecords;
+  if (historyIndex < 1) historyIndex = 1;
+}
+
+void displayHistoryRecord(int index) {
+  int totalRecords = EEPROM.read(EEPROM_COUNT_ADDR);
+  if (totalRecords == 0 || totalRecords > MAX_RECORDS) {
+    lcd.setCursor(0, 0); lcd.print("8.SORGU GECMISI ");
+    lcd.setCursor(0, 1); lcd.print(" KAYIT BULUNMADI");
+    return;
+  }
+
+  if (index < 1) index = totalRecords;
+  if (index > totalRecords) index = 1;
+  historyIndex = index;
+
+  int readAddr = EEPROM_START_ADDR + ((index - 1) * RECORD_SIZE);
+  int prof = EEPROM.read(readAddr + 0);
+  int str  = EEPROM.read(readAddr + 1);
+  int bpm  = EEPROM.read(readAddr + 2);
+  int lies = EEPROM.read(readAddr + 3);
+  int tru  = EEPROM.read(readAddr + 4);
+
+  lcd.setCursor(0, 0);
+  lcd.print("#"); lcd.print(index); lcd.print("/"); lcd.print(totalRecords);
+  lcd.print(" P:"); lcd.print(prof); lcd.print(" [1:SIL]");
+
+  lcd.setCursor(0, 1);
+  lcd.print("%"); lcd.print(str);
+  lcd.print(" "); lcd.print(bpm); lcd.print("BPM Y:");
+  lcd.print(lies); lcd.print(" G:%"); lcd.print(tru);
+}
+
+void displaySettingsMenu() {
+  lcd.clear();
+  if (menuPage == 1) {
+    lcd.setCursor(0, 0); lcd.print("1.YALAN ESIGI");
+    lcd.setCursor(0, 1); lcd.print("<  STRES %"); lcd.print(stressThreshold); lcd.print("  >");
+  } else if (menuPage == 2) {
+    lcd.setCursor(0, 0); lcd.print("2.PROFIL SECIMI");
+    lcd.setCursor(0, 1); lcd.print("<   PROFIL "); lcd.print(selectedProfile); lcd.print("   >");
+  } else if (menuPage == 3) {
+    lcd.setCursor(0, 0); lcd.print("3.TABAN NABIZ");
+    lcd.setCursor(0, 1); lcd.print("<   "); lcd.print(baseBPM); lcd.print(" BPM   >");
+  } else if (menuPage == 4) {
+    lcd.setCursor(0, 0); lcd.print("4.CILT TIPI");
+    lcd.setCursor(0, 1); lcd.print("< ");
+    if (skinType == 1) lcd.print("  NORMAL  ");
+    else if (skinType == 2) lcd.print("TERLI CILT");
+    else if (skinType == 3) lcd.print(" KURU CILT ");
+    lcd.print(" >");
+  } else if (menuPage == 5) {
+    lcd.setCursor(0, 0); lcd.print("5.SENSOR HIZI");
+    lcd.setCursor(0, 1); lcd.print("<   ");
+    if (sensorSpeed == 1) lcd.print("ANLIK ");
+    else lcd.print("STABIL");
+    lcd.print("   >");
+  } else if (menuPage == 6) {
+    lcd.setCursor(0, 0); lcd.print("6.SES / BUZZER");
+    lcd.setCursor(0, 1); lcd.print("<   "); lcd.print(soundEnabled ? "ACIK  " : "KAPALI"); lcd.print("   >");
+  } else if (menuPage == 7) {
+    lcd.setCursor(0, 0); lcd.print("7.AYARLARI SIFIR");
+    lcd.setCursor(0, 1); lcd.print("<  RESET ET  >");
+  } else if (menuPage == 8) {
+    displayHistoryRecord(historyIndex);
+  }
+}
+
+void resetToDefaults() {
+  stressThreshold = 55; soundEnabled = true; baseBPM = 70;
+  skinType = 1; sensorSpeed = 2; selectedProfile = 1;
+  lcd.clear(); lcd.setCursor(0, 0); lcd.print("FABRIKA AYARLARI");
+  lcd.setCursor(0, 1); lcd.print(" SIFIRLANDI! "); delay(1200);
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(GSR_PIN, INPUT_PULLUP);
+  
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, barFull);
+  lcd.createChar(1, heart);
+
+  lcd.setCursor(0, 0); lcd.print(" YALAN DEDEKTORU");
+  lcd.setCursor(0, 1); lcd.print(" OK'e Bas & Senk");
+
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+  lastActivityTime = millis();
+}
+
+int getFilteredRead() {
+  long sum = 0;
+  for (int i = 0; i < 20; i++) {
+    sum += analogRead(GSR_PIN);
+    delayMicroseconds(300);
+  }
+  return sum / 20;
+}
+
+void loop() {
+  // EKRAN KORUYUCU
+  if (!isSynchronized && !inSettings && !pinLocked && (millis() - lastActivityTime > 30000)) {
+    if (!inScreenSaver) {
+      inScreenSaver = true;
+      lcd.clear();
+    }
+    lcd.setCursor(0, 0); lcd.print(" SYSTEM STANDBY ");
+    lcd.setCursor(0, 1); lcd.print("  OK'E BASIN... ");
+  }
+
+  // IR KUMANDA ALICI
+  if (IrReceiver.decode()) {
+    unsigned long cmd = IrReceiver.decodedIRData.command;
+    lastActivityTime = millis();
+    
+    if (inScreenSaver) {
+      inScreenSaver = false;
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print(" YALAN DEDEKTORU");
+      lcd.setCursor(0, 1); lcd.print(" OK'e Bas & Senk");
+      IrReceiver.resume();
+      return;
+    }
+
+    // PIN KİLİT
+    if (pinLocked) {
+      if (cmd == TUS_1) {
+        pinDigitCount++;
+        lcd.print("*");
+        if (pinDigitCount >= 3) {
+          pinLocked = false;
+          inSettings = true;
+          menuPage = 1;
+          displaySettingsMenu();
+        }
+      } else if (cmd == TUS_2) {
+        pinLocked = false;
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("PIN IPTAL EDILDI");
+        delay(800); lcd.clear();
+      }
+      IrReceiver.resume();
+      return;
+    }
+
+    // 2 TUŞU: AYARLAR
+    if (cmd == TUS_2) {
+      if (inSettings) {
+        inSettings = false;
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("AYARLAR KAYDET!");
+        delay(800); lcd.clear();
+      } else {
+        pinLocked = true;
+        pinDigitCount = 0;
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("PIN GIRIN (1-1-1)");
+        lcd.setCursor(0, 1); lcd.print("PIN: ");
+      }
+    }
+
+    // AYARLAR MENÜSÜ KONTROLÜ
+    else if (inSettings) {
+      if (cmd == TUS_YUKARI) { menuPage--; if (menuPage < 1) menuPage = 8; displaySettingsMenu(); }
+      else if (cmd == TUS_ASAGI) { menuPage++; if (menuPage > 8) menuPage = 1; displaySettingsMenu(); }
+      else if (cmd == TUS_SAG) {
+        if (menuPage == 1 && stressThreshold < 80) stressThreshold += 5;
+        else if (menuPage == 2) { selectedProfile++; if (selectedProfile > 3) selectedProfile = 1; }
+        else if (menuPage == 3 && baseBPM < 85) baseBPM += 2;
+        else if (menuPage == 4) { skinType++; if (skinType > 3) skinType = 1; }
+        else if (menuPage == 5) { sensorSpeed = (sensorSpeed == 1) ? 2 : 1; }
+        else if (menuPage == 6) soundEnabled = !soundEnabled;
+        else if (menuPage == 7) resetToDefaults();
+        else if (menuPage == 8) displayHistoryRecord(historyIndex + 1);
+        if (menuPage != 8) displaySettingsMenu();
+      } else if (cmd == TUS_SOL) {
+        if (menuPage == 1 && stressThreshold > 30) stressThreshold -= 5;
+        else if (menuPage == 2) { selectedProfile--; if (selectedProfile < 1) selectedProfile = 3; }
+        else if (menuPage == 3 && baseBPM > 55) baseBPM -= 2;
+        else if (menuPage == 4) { skinType--; if (skinType < 1) skinType = 3; }
+        else if (menuPage == 5) { sensorSpeed = (sensorSpeed == 1) ? 2 : 1; }
+        else if (menuPage == 6) soundEnabled = !soundEnabled;
+        else if (menuPage == 7) resetToDefaults();
+        else if (menuPage == 8) displayHistoryRecord(historyIndex - 1);
+        if (menuPage != 8) displaySettingsMenu();
+      } else if (cmd == TUS_1 && menuPage == 8) {
+        // GEÇMİŞ SAYFASINDAYKEN '1' TUŞUNA BASILIRSA O ANKİ KAYDI SİL!
+        deleteSingleRecord(historyIndex);
+        displayHistoryRecord(historyIndex);
+      }
+    }
+
+    // CANLI KONTROLLER
+    else {
+      if (cmd == TUS_1) {
+        isFinished = true;
+        lcd.clear();
+        
+        int trustScore = 100;
+        if (totalReadings > 0) {
+          trustScore = 100 - ((badReadings * 100) / totalReadings);
+          if (trustScore < 0) trustScore = 0;
+        }
+
+        saveRecordToEEPROM(selectedProfile, maxStressPercent, maxBPM, lieDetectionCount, trustScore);
+
+        lcd.setCursor(0, 0);
+        lcd.print("MAX:%"); lcd.print(maxStressPercent);
+        lcd.print(" YALAN:"); lcd.print(lieDetectionCount);
+        
+        lcd.setCursor(0, 1);
+        lcd.print("GUVEN:%"); lcd.print(trustScore);
+        lcd.print(" "); lcd.print(maxBPM); lcd.print("BPM");
+      }
+      else if (cmd == TUS_OK) { 
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("SENKRONIZE...");
+        
+        long sum = 0;
+        for (int i = 0; i < 60; i++) { sum += getFilteredRead(); delay(50); }
+        dynamicBaseline = sum / 60.0;
+        filteredVal = dynamicBaseline;
+        lastRawVal = filteredVal;
+        
+        maxStressPercent = 0; maxBPM = 0; lieDetectionCount = 0;
+        totalReadings = 0; badReadings = 0;
+        isSynchronized = true; isFinished = false;
+        lcd.clear();
+      }
+    }
+    IrReceiver.resume();
+  }
+
+  // CANLI ÖLÇÜM SİSTEMİ
+  if (isSynchronized && !isFinished && !inSettings && !pinLocked) {
+    int rawVal = getFilteredRead();
+    totalReadings++;
+
+    if (rawVal > 980 || rawVal < 10) {
+      badReadings++;
+      lcd.setCursor(0, 0); lcd.print(" TEMAS KOPTU!  ");
+      lcd.setCursor(0, 1); lcd.print("PARMAGI KONTROL ");
+      delay(200);
+      return;
+    }
+
+    int rawDelta = abs(rawVal - lastRawVal);
+    if (rawDelta > 120) {
+      badReadings++;
+      lastRawVal = rawVal;
+      return;
+    }
+    lastRawVal = rawVal;
+
+    if (sensorSpeed == 1) filteredVal = rawVal;
+    else filteredVal = (filteredVal * 0.75) + (rawVal * 0.25);
+
+    int currentDiff = dynamicBaseline - filteredVal;
+    if (abs(currentDiff) < 5) {
+      dynamicBaseline = (dynamicBaseline * 0.98) + (filteredVal * 0.02);
+    }
+
+    if (currentDiff < 0) currentDiff = 0;
+
+    int maxRange = 25;
+    if (skinType == 2) maxRange = 35;
+    else if (skinType == 3) maxRange = 18;
+
+    int stressPercent = constrain(map(currentDiff, 0, maxRange, 0, 100), 0, 100);
+    int stressRateOfChange = stressPercent - previousStress;
+    previousStress = stressPercent;
+
+    bool isTrueLie = false;
+    if (stressPercent >= stressThreshold) {
+      if (!isHighStressActive) {
+        highStressStartTime = millis();
+        isHighStressActive = true;
+      }
+      if ((millis() - highStressStartTime > 1200) || (stressRateOfChange > 15)) {
+        isTrueLie = true;
+      }
+    } else {
+      isHighStressActive = false;
+    }
+
+    int randomFlicker = random(-2, 3); 
+    int approxBPM = map(stressPercent, 0, 100, baseBPM, baseBPM + 55) + randomFlicker;
+    approxBPM = constrain(approxBPM, 55, 145);
+
+    if (stressPercent > maxStressPercent) maxStressPercent = stressPercent;
+    if (approxBPM > maxBPM) maxBPM = approxBPM;
+
+    if (isTrueLie) {
+      static unsigned long lastLieTime = 0;
+      if (millis() - lastLieTime > 2000) {
+        lieDetectionCount++;
+        lastLieTime = millis();
+      }
+    }
+
+    lcd.setCursor(0, 0);
+    if (isTrueLie) lcd.print("YALAN! ");
+    else if (stressPercent >= (stressThreshold / 2)) lcd.print("SUPHE  ");
+    else lcd.print("DOGRU  ");
+
+    lcd.setCursor(7, 0);
+    lcd.print("STRES:%");
+    if (stressPercent < 10) lcd.print(" ");
+    lcd.print(stressPercent);
+    if (stressPercent < 100) lcd.print(" ");
+
+    lcd.setCursor(0, 1);
+    int numChars = map(stressPercent, 0, 100, 0, 9);
+    for (int i = 0; i < 9; i++) {
+      if (i < numChars) lcd.write(byte(0));
+      else lcd.print(" ");
+    }
+
+    lcd.setCursor(9, 1);
+    if (approxBPM < 100) lcd.print(" ");
+    lcd.print(approxBPM); lcd.print("BPM");
+
+    lcd.setCursor(15, 1);
+    if ((millis() / (120 - stressPercent)) % 2 == 0) lcd.write(1);
+    else lcd.print(" ");
+
+    delay(100); 
+  }
+}
