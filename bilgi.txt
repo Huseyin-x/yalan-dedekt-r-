@@ -1,0 +1,19 @@
+bu yalan dedektörü yapay zeka ile yapılmıştır kendisinde vücudumuzdai akıma göre tespit yapılır
+
+kumanda kontrolÜ
+OK=senkronize olma
+2=ayarlar/ayarlar çıkış
+1=sorguyu bitirme 
+sağ ok=ayar değiştirme
+sol ok=ayar değiştirme
+
+burdakisinyal yerleri A0 daki kablo sağ veya sol elimzden işaret parmağına takılmalı bide gnd kablosu 
+A0 ın takılı olduğu elin orta parmağına sabtlenmeli gnd kablosu ise A0 kablosununtakılı olduğu alin 
+orta parmağa takılmalı sonra senkronize olup sorular sorulmalı
+
+bu cihazda %50 - %60 ihtimalle doğruyu gösteriri
+
+kabloların takılı olduğu kişi parmaklarını haraket ettirmemelidir 
+aksi takdirde dedektör yanlış söyler
+
+youtube kanalı:www.youtube.com/@uypus
